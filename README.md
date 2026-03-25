@@ -283,4 +283,10 @@ npx ts-node src/index.ts
 
 ## License
 
-ISC
+[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+
+Copyright (c) 2026 Gareth Wright
+
+- **Free to use, copy, modify, and distribute** — but derivatives must remain open source under the same license.
+- **Non-commercial only** — you may not use this software or any derivative for commercial purposes.
+- **Attribution required** — credit the original author in any distribution.

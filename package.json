@@ -13,7 +13,7 @@
   },
   "keywords": ["pipedrive", "mcp", "crm"],
   "author": "",
-  "license": "ISC",
+  "license": "CC-BY-NC-SA-4.0",
   "description": "Comprehensive MCP server for Pipedrive CRM",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",
