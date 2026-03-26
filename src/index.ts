@@ -1440,8 +1440,9 @@ server.tool(
   {
     pipeline_id: z.number().optional().describe("Restrict to a pipeline"),
     stale_days: z.number().optional().describe("Days without activity to flag as stale (default 30)"),
+    limit: z.number().optional().describe("Max deals to return per risk category (default 50)"),
   },
-  async ({ pipeline_id, stale_days = 30 }) => {
+  async ({ pipeline_id, stale_days = 30, limit = 50 }) => {
     const allDeals = await fetchAllDeals({ status: "open", ...(pipeline_id ? { pipeline_id } : {}) });
 
     const today = new Date().toISOString().slice(0, 10);
@@ -1472,6 +1473,20 @@ server.tool(
     const staleByOwner = countBy(stale, d => d.owner_name || "Unknown");
     const byStage      = countBy(allDeals, d => d.stage_order_nr != null ? `Stage ${d.stage_order_nr}` : "Unknown");
 
+    // Sort stale by most days stale first, past close by most overdue first
+    const staleSorted = [...stale].sort((a, b) => {
+      const aDate = a.last_activity_date || a.update_time || "";
+      const bDate = b.last_activity_date || b.update_time || "";
+      return aDate < bDate ? -1 : 1;
+    });
+    const pastCloseSorted = [...pastCloseDate].sort((a, b) =>
+      a.expected_close_date < b.expected_close_date ? -1 : 1
+    );
+    const noNextSorted = [...noNextActivity].sort((a, b) => (b.value || 0) - (a.value || 0));
+    const missingValSorted = [...missingValue].sort((a, b) =>
+      (a.title || "").localeCompare(b.title || "")
+    );
+
     return ok({
       success: true,
       data: {
@@ -1488,18 +1503,22 @@ server.tool(
           zero_activities_ever: noActivities.length,
         },
         risks: {
-          stale: stale.map(d => ({
+          stale: staleSorted.slice(0, limit).map(d => ({
             id: d.id, title: d.title, value: d.value, owner: d.owner_name,
             last_activity: d.last_activity_date, updated: d.update_time?.slice(0, 10),
             days_stale: Math.floor((Date.now() - new Date(d.last_activity_date || d.update_time).getTime()) / 86400000),
           })),
-          past_close_date: pastCloseDate.map(d => ({
+          stale_truncated: stale.length > limit,
+          past_close_date: pastCloseSorted.slice(0, limit).map(d => ({
             id: d.id, title: d.title, value: d.value, owner: d.owner_name,
             expected_close: d.expected_close_date,
             days_overdue: Math.floor((Date.now() - new Date(d.expected_close_date).getTime()) / 86400000),
           })),
-          missing_value: missingValue.map(d => ({ id: d.id, title: d.title, owner: d.owner_name, stage: d.stage_order_nr })),
-          no_next_activity: noNextActivity.map(d => ({ id: d.id, title: d.title, value: d.value, owner: d.owner_name })),
+          past_close_truncated: pastCloseDate.length > limit,
+          missing_value: missingValSorted.slice(0, limit).map(d => ({ id: d.id, title: d.title, owner: d.owner_name, stage: d.stage_order_nr })),
+          missing_value_truncated: missingValue.length > limit,
+          no_next_activity: noNextSorted.slice(0, limit).map(d => ({ id: d.id, title: d.title, value: d.value, owner: d.owner_name })),
+          no_next_activity_truncated: noNextActivity.length > limit,
         },
         stale_by_owner: sortedEntries(staleByOwner),
         deals_by_stage: sortedEntries(byStage),
