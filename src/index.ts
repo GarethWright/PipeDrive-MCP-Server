@@ -1401,11 +1401,12 @@ server.tool(
       revenueByOwner[owner] = (revenueByOwner[owner] || 0) + (d.value || 0);
     }
 
-    // Team median close time (across all won deals)
+    // Team median close time (across all won deals). Floor at 1 day to avoid
+    // division-by-zero when many deals close same day (median=0).
     const allCloseTimes = won.map(daysToClose).filter((d): d is number => d !== null).sort((a, b) => a - b);
-    const teamMedianClose = allCloseTimes.length > 0
+    const teamMedianClose = Math.max(1, allCloseTimes.length > 0
       ? allCloseTimes[Math.floor(allCloseTimes.length / 2)]
-      : 30; // fallback if no data
+      : 30);
 
     // Avg deal value per owner, and max across team
     const avgValueByOwner: Record<string, number> = {};
