@@ -1354,6 +1354,124 @@ server.tool(
     // Won by pipeline/stage
     const wonByStage = countBy(won, d => d.stage_order_nr ? `Stage ${d.stage_order_nr}` : "Unknown");
 
+    // ── Composite performance score ──────────────────────────────────────
+    // Considers four dimensions:
+    //   1. Win Rate    (30%) — deals won / total closed
+    //   2. Volume      (25%) — number of won deals, normalised to top performer
+    //   3. Speed       (20%) — avg days to close, benchmarked against team median
+    //   4. Deal Value  (25%) — avg won deal value, normalised to team top
+    //
+    // WHY FOUR DIMENSIONS:
+    //   Win rate alone is misleading — 100% on 2 deals beats 50% on 100.
+    //   Volume alone rewards churn on small call-outs.
+    //   Speed alone rewards cherry-picking easy wins.
+    //   Value alone rewards one lucky whale.
+    //   Together they identify who consistently closes meaningful deals
+    //   at a good rate in a reasonable timeframe.
+    //
+    // Volume uses the top performer as the reference (score 1.0) so that
+    // someone with 2 wins out of 100+ deals by the top seller isn't rewarded.
+    //
+    // Speed uses the team median close time as a reference. Faster than
+    // median → multiplier > 1 (capped at 1.5×). Slower → < 1 (floored at 0.5×).
+    //
+    // Deal value uses the highest avg won deal value as the reference (1.0).
+    // This separates reps landing £50k contracts from reps doing £100 call-outs.
+
+    const allOwners = new Set([...Object.keys(wonByOwner), ...Object.keys(lostByOwner)]);
+    const maxWon = Math.max(...Object.values(wonByOwner), 1);
+
+    // Calculate avg days-to-close per owner from won deals (add_time → won_time)
+    function daysToClose(d: any): number | null {
+      if (!d.add_time || !d.won_time) return null;
+      const added = new Date(d.add_time).getTime();
+      const closed = new Date(d.won_time).getTime();
+      if (isNaN(added) || isNaN(closed)) return null;
+      return Math.max(0, (closed - added) / 86400000);
+    }
+
+    const closeTimesByOwner: Record<string, number[]> = {};
+    const revenueByOwner: Record<string, number> = {};
+    for (const d of won) {
+      const owner = d.owner_name || d.user_id?.name || "Unknown";
+      const days = daysToClose(d);
+      if (days !== null) {
+        (closeTimesByOwner[owner] ??= []).push(days);
+      }
+      revenueByOwner[owner] = (revenueByOwner[owner] || 0) + (d.value || 0);
+    }
+
+    // Team median close time (across all won deals)
+    const allCloseTimes = won.map(daysToClose).filter((d): d is number => d !== null).sort((a, b) => a - b);
+    const teamMedianClose = allCloseTimes.length > 0
+      ? allCloseTimes[Math.floor(allCloseTimes.length / 2)]
+      : 30; // fallback if no data
+
+    // Avg deal value per owner, and max across team
+    const avgValueByOwner: Record<string, number> = {};
+    for (const owner of Object.keys(wonByOwner)) {
+      avgValueByOwner[owner] = wonByOwner[owner] > 0
+        ? revenueByOwner[owner] / wonByOwner[owner]
+        : 0;
+    }
+    const maxAvgValue = Math.max(...Object.values(avgValueByOwner), 1);
+
+    const leaderboard = Array.from(allOwners).map(owner => {
+      const w = wonByOwner[owner] || 0;
+      const l = lostByOwner[owner] || 0;
+      const total = w + l;
+      const ownerWinRate = total > 0 ? w / total : 0;
+
+      // Volume: normalised 0–1 against top performer
+      const volumeScore = w / maxWon;
+
+      // Speed: avg close time for this owner vs team median
+      const ownerTimes = closeTimesByOwner[owner] || [];
+      const avgClose = ownerTimes.length > 0
+        ? ownerTimes.reduce((a, b) => a + b, 0) / ownerTimes.length
+        : null;
+      // speedMultiplier: median / avg  →  faster = higher. Clamped [0.5, 1.5]
+      const speedMultiplier = avgClose !== null && avgClose > 0
+        ? Math.min(1.5, Math.max(0.5, teamMedianClose / avgClose))
+        : 1.0; // neutral if no data
+
+      // Deal value: avg won value normalised to top performer
+      const ownerAvgValue = avgValueByOwner[owner] || 0;
+      const valueScore = ownerAvgValue / maxAvgValue;
+      const totalRevenue = revenueByOwner[owner] || 0;
+
+      // Weighted composite (0–100)
+      const composite = (
+        (ownerWinRate * 30) +
+        (volumeScore * 25) +
+        (speedMultiplier / 1.5 * 20) + // normalise [0.5–1.5] → [0.33–1.0] × 20
+        (valueScore * 25)
+      );
+
+      return {
+        owner,
+        won: w,
+        lost: l,
+        win_rate_pct: total > 0 ? `${(ownerWinRate * 100).toFixed(1)}%` : "N/A",
+        total_revenue_won: Math.round(totalRevenue),
+        avg_deal_value: Math.round(ownerAvgValue),
+        avg_days_to_close: avgClose !== null ? Math.round(avgClose) : "N/A",
+        team_median_days_to_close: Math.round(teamMedianClose),
+        speed_vs_team: avgClose !== null
+          ? (avgClose < teamMedianClose ? `${Math.round((1 - avgClose / teamMedianClose) * 100)}% faster` :
+             avgClose > teamMedianClose ? `${Math.round((avgClose / teamMedianClose - 1) * 100)}% slower` :
+             "at median")
+          : "N/A",
+        performance_score: Math.round(composite * 10) / 10,
+        score_breakdown: {
+          win_rate_component: `${(Math.round(ownerWinRate * 30 * 10) / 10).toFixed(1)} / 30`,
+          volume_component: `${(Math.round(volumeScore * 25 * 10) / 10).toFixed(1)} / 25`,
+          speed_component: `${(Math.round(speedMultiplier / 1.5 * 20 * 10) / 10).toFixed(1)} / 20`,
+          value_component: `${(Math.round(valueScore * 25 * 10) / 10).toFixed(1)} / 25`,
+        },
+      };
+    }).sort((a, b) => b.performance_score - a.performance_score);
+
     const report = {
       period: { type: period, start, end },
       summary: {
@@ -1369,8 +1487,16 @@ server.tool(
       },
       won_deals: won.map(d => ({ id: d.id, title: d.title, value: d.value, owner: d.owner_name, org: d.org_name, won_date: d.won_time?.slice(0, 10) })),
       lost_deals: lost.map(d => ({ id: d.id, title: d.title, value: d.value, owner: d.owner_name, org: d.org_name, lost_reason: d.lost_reason, lost_date: d.lost_time?.slice(0, 10) })),
-      leaderboard: {
-        won_by_owner: sortedEntries(wonByOwner).map(([owner, count]) => ({ owner, won: count, lost: lostByOwner[owner] || 0 })),
+      leaderboard,
+      scoring_methodology: {
+        description: "Composite score (0-100) balancing four dimensions. Prevents gaming by any single metric — high win rate on tiny volume, lots of small call-outs, or one lucky whale.",
+        weights: {
+          win_rate: "30% — deals won ÷ total closed deals",
+          volume: "25% — won deals normalised against top performer (highest wins = 1.0)",
+          speed: "20% — avg days to close vs team median. Faster → higher (capped 1.5×), slower → lower (floored 0.5×)",
+          deal_value: "25% — avg won deal value normalised against top performer. Rewards landing bigger contracts over accumulating small call-outs",
+        },
+        example: "Person A: 50% win rate, 100 deals, avg £500, fast closer → high volume+speed, low value = ~55. Person B: 100% win rate, 2 deals, avg £50k → great rate+value, negligible volume = ~42. Person C: 70% win rate, 60 deals, avg £5k, slow → balanced across all = ~58. The best performer is the one who consistently wins meaningful deals at pace.",
       },
       won_by_stage: sortedEntries(wonByStage),
     };
