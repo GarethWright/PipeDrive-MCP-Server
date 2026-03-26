@@ -1246,6 +1246,482 @@ server.tool(
 );
 
 // ---------------------------------------------------------------------------
+// REPORTING & ANALYTICS
+// ---------------------------------------------------------------------------
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function periodBounds(period: "daily" | "weekly" | "monthly", offsetPeriods = 0): { start: string; end: string } {
+  const now = new Date();
+  let s: Date, e: Date;
+  if (period === "daily") {
+    s = new Date(now); s.setDate(s.getDate() - offsetPeriods); s.setHours(0, 0, 0, 0);
+    e = new Date(s); e.setHours(23, 59, 59, 999);
+  } else if (period === "weekly") {
+    const day = now.getDay(); // 0=Sun
+    s = new Date(now); s.setDate(s.getDate() - day - offsetPeriods * 7); s.setHours(0, 0, 0, 0);
+    e = new Date(s); e.setDate(e.getDate() + 6); e.setHours(23, 59, 59, 999);
+  } else {
+    s = new Date(now.getFullYear(), now.getMonth() - offsetPeriods, 1);
+    e = new Date(now.getFullYear(), now.getMonth() - offsetPeriods + 1, 0, 23, 59, 59, 999);
+  }
+  return { start: s.toISOString().slice(0, 10), end: e.toISOString().slice(0, 10) };
+}
+
+async function fetchAllPages(endpoint: string, params: Record<string, any> = {}): Promise<any[]> {
+  const results: any[] = [];
+  let start = 0;
+  const limit = 500;
+  while (true) {
+    const res = await pd("GET", endpoint, undefined, { ...params, start, limit });
+    if (!res.success) {
+      console.error(`fetchAllPages error on ${endpoint} at start=${start}:`, res.error);
+      break;
+    }
+    const page: any[] = Array.isArray(res.data) ? res.data : [];
+    results.push(...page);
+    // Stop if no more pages or we received fewer items than requested
+    if (!res.additional_data?.pagination?.more_items_in_collection || page.length < limit) break;
+    start += limit;
+  }
+  return results;
+}
+
+const fetchAllDeals      = (params: Record<string, any> = {}) => fetchAllPages("/deals",      params);
+const fetchAllActivities = (params: Record<string, any> = {}) => fetchAllPages("/activities", params);
+
+function inRange(dateStr: string | null | undefined, start: string, end: string): boolean {
+  if (!dateStr) return false;
+  const d = dateStr.slice(0, 10);
+  return d >= start && d <= end;
+}
+
+function countBy<T>(arr: T[], key: (item: T) => string): Record<string, number> {
+  return arr.reduce((acc, item) => {
+    const k = key(item) || "Unknown";
+    acc[k] = (acc[k] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+}
+
+function sumBy<T>(arr: T[], key: (item: T) => number): number {
+  return arr.reduce((acc, item) => acc + (key(item) || 0), 0);
+}
+
+function sortedEntries(obj: Record<string, number>): [string, number][] {
+  return Object.entries(obj).sort((a, b) => b[1] - a[1]);
+}
+
+// ── Tools ─────────────────────────────────────────────────────────────────────
+
+server.tool(
+  "pipedrive_performance_report",
+  "Generate a performance report for a given period (daily/weekly/monthly). Returns wins, losses, new deals, revenue, conversion rate, average deal size, and top performers.",
+  {
+    period: z.enum(["daily", "weekly", "monthly"]).describe("Report period"),
+    offset: z.number().optional().describe("How many periods back (0 = current, 1 = previous, etc.)"),
+    pipeline_id: z.number().optional().describe("Restrict report to a specific pipeline"),
+  },
+  async ({ period, offset = 0, pipeline_id }) => {
+    const { start, end } = periodBounds(period, offset);
+    const allDeals = await fetchAllDeals({ status: "all_not_deleted", ...(pipeline_id ? { pipeline_id } : {}) });
+
+    const won    = allDeals.filter(d => d.status === "won"  && inRange(d.won_time, start, end));
+    const lost   = allDeals.filter(d => d.status === "lost" && inRange(d.lost_time, start, end));
+    const opened = allDeals.filter(d => inRange(d.add_time, start, end));
+    const open   = allDeals.filter(d => d.status === "open");
+
+    const wonValue  = sumBy(won,  d => d.value || 0);
+    const lostValue = sumBy(lost, d => d.value || 0);
+    const pipelineValue = sumBy(open, d => d.value || 0);
+
+    const totalClosed = won.length + lost.length;
+    const winRate = totalClosed > 0 ? ((won.length / totalClosed) * 100).toFixed(1) : "N/A";
+    const avgWonSize = won.length > 0 ? Math.round(wonValue / won.length) : 0;
+
+    // Won by owner
+    const wonByOwner  = countBy(won,  d => d.owner_name || d.user_id?.name);
+    const lostByOwner = countBy(lost, d => d.owner_name || d.user_id?.name);
+
+    // Won by pipeline/stage
+    const wonByStage = countBy(won, d => d.stage_order_nr ? `Stage ${d.stage_order_nr}` : "Unknown");
+
+    const report = {
+      period: { type: period, start, end },
+      summary: {
+        deals_won: won.length,
+        deals_lost: lost.length,
+        deals_opened: opened.length,
+        open_pipeline_count: open.length,
+        win_rate_pct: winRate,
+        revenue_won: wonValue,
+        revenue_lost: lostValue,
+        open_pipeline_value: pipelineValue,
+        avg_won_deal_size: avgWonSize,
+      },
+      won_deals: won.map(d => ({ id: d.id, title: d.title, value: d.value, owner: d.owner_name, org: d.org_name, won_date: d.won_time?.slice(0, 10) })),
+      lost_deals: lost.map(d => ({ id: d.id, title: d.title, value: d.value, owner: d.owner_name, org: d.org_name, lost_reason: d.lost_reason, lost_date: d.lost_time?.slice(0, 10) })),
+      leaderboard: {
+        won_by_owner: sortedEntries(wonByOwner).map(([owner, count]) => ({ owner, won: count, lost: lostByOwner[owner] || 0 })),
+      },
+      won_by_stage: sortedEntries(wonByStage),
+    };
+
+    return ok({ success: true, data: report });
+  }
+);
+
+server.tool(
+  "pipedrive_loss_analysis",
+  "Analyse lost deals to identify patterns: top loss reasons, loss by owner, loss by stage, loss by organisation type, and trends over time.",
+  {
+    period: z.enum(["daily", "weekly", "monthly"]).optional().describe("Period window (omit for all-time)"),
+    offset: z.number().optional().describe("Periods back (0 = current)"),
+    pipeline_id: z.number().optional().describe("Restrict to a pipeline"),
+    min_value: z.number().optional().describe("Only include deals above this value"),
+  },
+  async ({ period, offset = 0, pipeline_id, min_value }) => {
+    let start = "2000-01-01", end = "2999-12-31";
+    if (period) ({ start, end } = periodBounds(period, offset));
+
+    const allDeals = await fetchAllDeals({ status: "lost", ...(pipeline_id ? { pipeline_id } : {}) });
+    const lost = allDeals.filter(d =>
+      inRange(d.lost_time, start, end) &&
+      (!min_value || (d.value || 0) >= min_value)
+    );
+
+    const byReason  = countBy(lost, d => d.lost_reason || "No reason logged");
+    const byOwner   = countBy(lost, d => d.owner_name || "Unknown");
+    const byOrg     = countBy(lost, d => d.org_name   || "No organisation");
+    const byStage   = countBy(lost, d => d.stage_order_nr != null ? `Stage ${d.stage_order_nr}` : "Unknown");
+
+    // Monthly trend
+    const byMonth: Record<string, number> = {};
+    for (const d of lost) {
+      const m = (d.lost_time || "").slice(0, 7);
+      if (m) byMonth[m] = (byMonth[m] || 0) + 1;
+    }
+
+    // No-reason rate
+    const noReasonCount = lost.filter(d => !d.lost_reason).length;
+    const noReasonPct = lost.length > 0 ? ((noReasonCount / lost.length) * 100).toFixed(1) : "0";
+
+    const totalLostValue = sumBy(lost, d => d.value || 0);
+
+    return ok({
+      success: true,
+      data: {
+        period: period ? { type: period, start, end } : "all-time",
+        summary: {
+          total_lost: lost.length,
+          total_lost_value: totalLostValue,
+          no_reason_logged: noReasonCount,
+          no_reason_pct: `${noReasonPct}%`,
+        },
+        top_loss_reasons: sortedEntries(byReason),
+        loss_by_owner: sortedEntries(byOwner),
+        loss_by_stage: sortedEntries(byStage),
+        loss_by_organisation: sortedEntries(byOrg).slice(0, 20),
+        monthly_trend: Object.entries(byMonth).sort((a, b) => a[0].localeCompare(b[0])),
+        deals: lost.map(d => ({
+          id: d.id, title: d.title, value: d.value, owner: d.owner_name,
+          org: d.org_name, stage: d.stage_order_nr,
+          lost_reason: d.lost_reason || null,
+          lost_date: d.lost_time?.slice(0, 10),
+        })),
+      },
+    });
+  }
+);
+
+server.tool(
+  "pipedrive_pipeline_health",
+  "Assess open pipeline health: stale deals (no activity in N days), deals missing key data, deals past expected close date, and overall weighted value.",
+  {
+    pipeline_id: z.number().optional().describe("Restrict to a pipeline"),
+    stale_days: z.number().optional().describe("Days without activity to flag as stale (default 30)"),
+  },
+  async ({ pipeline_id, stale_days = 30 }) => {
+    const allDeals = await fetchAllDeals({ status: "open", ...(pipeline_id ? { pipeline_id } : {}) });
+
+    const today = new Date().toISOString().slice(0, 10);
+    const staleThreshold = new Date();
+    staleThreshold.setDate(staleThreshold.getDate() - stale_days);
+    const staleDate = staleThreshold.toISOString().slice(0, 10);
+
+    const stale = allDeals.filter(d => {
+      const lastActivity = d.last_activity_date;
+      const updated = (d.update_time || "").slice(0, 10);
+      const reference = lastActivity || updated;
+      return reference < staleDate;
+    });
+
+    const pastCloseDate = allDeals.filter(d =>
+      d.expected_close_date && d.expected_close_date < today
+    );
+
+    const missingOrg    = allDeals.filter(d => !d.org_id);
+    const missingPerson = allDeals.filter(d => !d.person_id);
+    const missingValue  = allDeals.filter(d => !d.value || d.value === 0);
+    const noNextActivity = allDeals.filter(d => !d.next_activity_id);
+    const noActivities  = allDeals.filter(d => !d.activities_count || d.activities_count === 0);
+
+    const totalValue    = sumBy(allDeals, d => d.value || 0);
+    const weightedValue = sumBy(allDeals, d => d.weighted_value || 0);
+
+    const staleByOwner = countBy(stale, d => d.owner_name || "Unknown");
+    const byStage      = countBy(allDeals, d => d.stage_order_nr != null ? `Stage ${d.stage_order_nr}` : "Unknown");
+
+    return ok({
+      success: true,
+      data: {
+        summary: {
+          total_open_deals: allDeals.length,
+          total_pipeline_value: totalValue,
+          weighted_pipeline_value: weightedValue,
+          stale_deals: stale.length,
+          past_expected_close: pastCloseDate.length,
+          missing_organisation: missingOrg.length,
+          missing_contact: missingPerson.length,
+          missing_value: missingValue.length,
+          no_next_activity_scheduled: noNextActivity.length,
+          zero_activities_ever: noActivities.length,
+        },
+        risks: {
+          stale: stale.map(d => ({
+            id: d.id, title: d.title, value: d.value, owner: d.owner_name,
+            last_activity: d.last_activity_date, updated: d.update_time?.slice(0, 10),
+            days_stale: Math.floor((Date.now() - new Date(d.last_activity_date || d.update_time).getTime()) / 86400000),
+          })),
+          past_close_date: pastCloseDate.map(d => ({
+            id: d.id, title: d.title, value: d.value, owner: d.owner_name,
+            expected_close: d.expected_close_date,
+            days_overdue: Math.floor((Date.now() - new Date(d.expected_close_date).getTime()) / 86400000),
+          })),
+          missing_value: missingValue.map(d => ({ id: d.id, title: d.title, owner: d.owner_name, stage: d.stage_order_nr })),
+          no_next_activity: noNextActivity.map(d => ({ id: d.id, title: d.title, value: d.value, owner: d.owner_name })),
+        },
+        stale_by_owner: sortedEntries(staleByOwner),
+        deals_by_stage: sortedEntries(byStage),
+      },
+    });
+  }
+);
+
+server.tool(
+  "pipedrive_activity_audit",
+  "Audit activity logging quality: deals with no activities, overdue activities, missing call logs, and rep-level logging hygiene scores.",
+  {
+    pipeline_id: z.number().optional().describe("Restrict to a pipeline"),
+    days_back: z.number().optional().describe("Look-back window in days (default 90)"),
+  },
+  async ({ pipeline_id, days_back = 90 }) => {
+    const since = new Date();
+    since.setDate(since.getDate() - days_back);
+    const sinceStr = since.toISOString().slice(0, 10);
+
+    const [openDeals, activities] = await Promise.all([
+      fetchAllDeals({ status: "open", ...(pipeline_id ? { pipeline_id } : {}) }),
+      fetchAllActivities({ start_date: sinceStr, done: 0 }),
+    ]);
+
+    const overdueActivities = activities.filter(a => {
+      if (a.done) return false;
+      const due = a.due_date;
+      return due && due < new Date().toISOString().slice(0, 10);
+    });
+
+    // Deals with zero logged activities
+    const noActivity   = openDeals.filter(d => !d.activities_count || d.activities_count === 0);
+    const noDoneActs   = openDeals.filter(d => !d.done_activities_count || d.done_activities_count === 0);
+
+    // Overdue by owner
+    const overdueByOwner = countBy(overdueActivities, a => a.owner_name || a.user_id?.name || "Unknown");
+
+    // Activity type breakdown
+    const typeBreakdown = countBy(activities, a => a.type || "unknown");
+
+    // Per-rep hygiene: open deals vs logged activities
+    const repDeals: Record<string, number>    = countBy(openDeals, d => d.owner_name || "Unknown");
+    const repNoActs: Record<string, number>   = countBy(noActivity, d => d.owner_name || "Unknown");
+    const repOverdue: Record<string, number>  = countBy(overdueActivities, a => a.owner_name || a.user_id?.name || "Unknown");
+
+    const repHygiene = Object.keys(repDeals).map(rep => ({
+      rep,
+      open_deals: repDeals[rep] || 0,
+      deals_with_no_activity: repNoActs[rep] || 0,
+      overdue_activities: repOverdue[rep] || 0,
+      hygiene_score: (() => {
+        const total = repDeals[rep] || 1;
+        const issues = (repNoActs[rep] || 0) + (repOverdue[rep] || 0);
+        return Math.max(0, Math.round((1 - issues / total) * 100));
+      })(),
+    })).sort((a, b) => a.hygiene_score - b.hygiene_score);
+
+    return ok({
+      success: true,
+      data: {
+        summary: {
+          open_deals_audited: openDeals.length,
+          deals_with_zero_activities: noActivity.length,
+          deals_with_zero_completed_activities: noDoneActs.length,
+          overdue_activities: overdueActivities.length,
+          activity_types_logged: typeBreakdown,
+        },
+        overdue_activities: overdueActivities.map(a => ({
+          id: a.id, subject: a.subject, type: a.type, due_date: a.due_date,
+          owner: a.owner_name || a.user_id?.name, deal_id: a.deal_id,
+          days_overdue: Math.floor((Date.now() - new Date(a.due_date).getTime()) / 86400000),
+        })),
+        overdue_by_owner: sortedEntries(overdueByOwner),
+        deals_with_no_activity: noActivity.map(d => ({ id: d.id, title: d.title, owner: d.owner_name, value: d.value, added: d.add_time?.slice(0, 10) })),
+        rep_hygiene_scores: repHygiene,
+      },
+    });
+  }
+);
+
+server.tool(
+  "pipedrive_opportunities_report",
+  "Identify high-value opportunities: deals advancing in pipeline, deals with high probability, recently re-engaged deals, and leads not yet converted.",
+  {
+    pipeline_id: z.number().optional().describe("Restrict to a pipeline"),
+    min_value: z.number().optional().describe("Minimum deal value to include"),
+    top_n: z.number().optional().describe("Return top N deals per category (default 20)"),
+  },
+  async ({ pipeline_id, min_value = 0, top_n = 20 }) => {
+    const [openDeals, leads] = await Promise.all([
+      fetchAllDeals({ status: "open", ...(pipeline_id ? { pipeline_id } : {}) }),
+      pd("GET", "/leads", undefined, { limit: 500 }),
+    ]);
+
+    const filtered = openDeals.filter(d => (d.value || 0) >= min_value);
+
+    // High probability
+    const highProb = filtered
+      .filter(d => d.probability != null && d.probability >= 70)
+      .sort((a, b) => (b.value || 0) - (a.value || 0))
+      .slice(0, top_n);
+
+    // High value open deals
+    const highValue = [...filtered]
+      .sort((a, b) => (b.value || 0) - (a.value || 0))
+      .slice(0, top_n);
+
+    // Recently active (activity in last 7 days)
+    const recentDate = new Date(); recentDate.setDate(recentDate.getDate() - 7);
+    const recentStr = recentDate.toISOString().slice(0, 10);
+    const recentlyActive = filtered
+      .filter(d => d.last_activity_date && d.last_activity_date >= recentStr)
+      .sort((a, b) => (b.value || 0) - (a.value || 0))
+      .slice(0, top_n);
+
+    // Closing soon (expected close within 30 days)
+    const today = new Date().toISOString().slice(0, 10);
+    const in30  = new Date(); in30.setDate(in30.getDate() + 30);
+    const in30Str = in30.toISOString().slice(0, 10);
+    const closingSoon = filtered
+      .filter(d => d.expected_close_date && d.expected_close_date >= today && d.expected_close_date <= in30Str)
+      .sort((a, b) => (a.expected_close_date || "").localeCompare(b.expected_close_date || ""))
+      .slice(0, top_n);
+
+    // Unconverted leads
+    const unconvertedLeads = (leads.data || []).filter((l: any) => !l.is_archived);
+
+    const fmt = (d: any) => ({
+      id: d.id, title: d.title, value: d.value, probability: d.probability,
+      owner: d.owner_name, org: d.org_name,
+      expected_close: d.expected_close_date,
+      last_activity: d.last_activity_date,
+      next_activity: d.next_activity_date,
+      stage: d.stage_order_nr,
+    });
+
+    return ok({
+      success: true,
+      data: {
+        summary: {
+          total_open_deals: filtered.length,
+          total_pipeline_value: sumBy(filtered, d => d.value || 0),
+          high_probability_count: highProb.length,
+          closing_within_30_days: closingSoon.length,
+          unconverted_leads: unconvertedLeads.length,
+        },
+        high_value_deals: highValue.map(fmt),
+        high_probability_deals: highProb.map(fmt),
+        closing_soon: closingSoon.map(fmt),
+        recently_active: recentlyActive.map(fmt),
+        unconverted_leads: unconvertedLeads.slice(0, top_n).map((l: any) => ({
+          id: l.id, title: l.title, value: l.value?.amount,
+          owner: l.owner?.name, created: l.add_time?.slice(0, 10),
+        })),
+      },
+    });
+  }
+);
+
+server.tool(
+  "pipedrive_comparative_report",
+  "Compare performance across two consecutive periods (e.g. this month vs last month): deals won/lost, revenue, win rate, and rep-level changes.",
+  {
+    period: z.enum(["daily", "weekly", "monthly"]).describe("Period type to compare"),
+    pipeline_id: z.number().optional().describe("Restrict to a pipeline"),
+  },
+  async ({ period, pipeline_id }) => {
+    const current  = periodBounds(period, 0);
+    const previous = periodBounds(period, 1);
+
+    const allDeals = await fetchAllDeals({ status: "all_not_deleted", ...(pipeline_id ? { pipeline_id } : {}) });
+
+    const periodStats = (start: string, end: string) => {
+      const won    = allDeals.filter(d => d.status === "won"  && inRange(d.won_time,  start, end));
+      const lost   = allDeals.filter(d => d.status === "lost" && inRange(d.lost_time, start, end));
+      const opened = allDeals.filter(d => inRange(d.add_time, start, end));
+      const closed = won.length + lost.length;
+      return {
+        won: won.length,
+        lost: lost.length,
+        opened: opened.length,
+        revenue: sumBy(won, d => d.value || 0),
+        win_rate: closed > 0 ? parseFloat(((won.length / closed) * 100).toFixed(1)) : 0,
+        avg_deal_size: won.length > 0 ? Math.round(sumBy(won, d => d.value || 0) / won.length) : 0,
+        by_owner: countBy(won, d => d.owner_name || "Unknown"),
+      };
+    };
+
+    const curr = periodStats(current.start, current.end);
+    const prev = periodStats(previous.start, previous.end);
+
+    const pct = (a: number, b: number) => b === 0 ? (a > 0 ? "+∞%" : "0%") : `${a >= b ? "+" : ""}${(((a - b) / b) * 100).toFixed(1)}%`;
+
+    // Owner comparison
+    const allOwners = new Set([...Object.keys(curr.by_owner), ...Object.keys(prev.by_owner)]);
+    const ownerComparison = Array.from(allOwners).map(owner => ({
+      owner,
+      current_won: curr.by_owner[owner] || 0,
+      previous_won: prev.by_owner[owner] || 0,
+      change: pct(curr.by_owner[owner] || 0, prev.by_owner[owner] || 0),
+    })).sort((a, b) => b.current_won - a.current_won);
+
+    return ok({
+      success: true,
+      data: {
+        current_period:  { ...current,  ...curr },
+        previous_period: { ...previous, ...prev },
+        changes: {
+          won:      pct(curr.won,      prev.won),
+          lost:     pct(curr.lost,     prev.lost),
+          opened:   pct(curr.opened,   prev.opened),
+          revenue:  pct(curr.revenue,  prev.revenue),
+          win_rate: `${(curr.win_rate - prev.win_rate).toFixed(1)}pp`,
+        },
+        owner_comparison: ownerComparison,
+      },
+    });
+  }
+);
+
+// ---------------------------------------------------------------------------
 // Start server
 // ---------------------------------------------------------------------------
 
